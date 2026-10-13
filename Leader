@@ -1,0 +1,140 @@
+#include <iostream>
+#include <vector>
+#include <string>
+#include <chrono>
+#include <thread>
+#include <cmath>
+#include <numeric>
+#include <algorithm>
+#include <random>
+#include <atomic>
+#include <memory>
+#include <future>
+
+#ifdef _WIN32
+    #include <winsock2.h>
+    #include <ws2tcpip.h>
+    #pragma comment(lib, "ws2_32.lib")
+#else
+    #include <sys/socket.h>
+    #include <arpa/inet.h>
+    #include <netdb.h>
+    #include <unistd.h>
+#endif
+
+void close_socket(int sock) {
+#ifdef _WIN32
+    closesocket(sock);
+#else
+    close(sock);
+#endif
+}
+
+// BACKEND SERVER NODE WITH ATOMIC CONNECTION TRACKING
+
+struct BackendServer {
+    std::string id;
+    std::string ip_address;
+    int port;
+    std::string health_path;
+
+    mutable std::atomic<int> active_connections{0};
+
+    bool is_alive{true}; // Default to true for simulated runs
+    double last_latency_ms{10.0};
+    double dynamic_score{100.0};
+    std::vector<double> latency_history;
+
+    BackendServer(std::string id, std::string ip, int port, std::string path = "/healthz")
+        : id(std::move(id)), ip_address(std::move(ip)), port(port), health_path(std::move(path)) {}
+};
+
+
+// RAII GUARD FOR CONNECTION LIFECYCLE MANAGEMENT
+class ScopedConnection {
+private:
+    std::shared_ptr<BackendServer> server;
+
+public:
+    explicit ScopedConnection(std::shared_ptr<BackendServer> s) : server(std::move(s)) {
+        if (server) {
+            server->active_connections.fetch_add(1, std::memory_order_relaxed);
+        }
+    }
+
+    ~ScopedConnection() {
+        if (server) {
+            server->active_connections.fetch_sub(1, std::memory_order_relaxed);
+        }
+    }
+
+    std::shared_ptr<BackendServer> getServer() const { return server; }
+};
+
+
+// DYNAMIC P2C LOAD BALANCER
+
+class DynamicP2CLoadBalancer {
+private:
+    std::vector<std::shared_ptr<BackendServer>> servers;
+
+public:
+    DynamicP2CLoadBalancer() {
+#ifdef _WIN32
+        WSADATA wsaData;
+        WSAStartup(MAKEWORD(2, 2), &wsaData);
+#endif
+    }
+
+    ~DynamicP2CLoadBalancer() {
+#ifdef _WIN32
+        WSACleanup();
+#endif
+    }
+
+    void addServer(const std::shared_ptr<BackendServer>& server) {
+        servers.push_back(server);
+        std::cout << "[INFO] Added Server " << server->id 
+                  << " (" << server->ip_address << ":" << server->port << ")\n";
+    }
+
+    const std::vector<std::shared_ptr<BackendServer>>& getServers() const {
+        return servers;
+    }
+
+    std::shared_ptr<BackendServer> getBestServer() const {
+        if (servers.empty()) {
+            throw std::runtime_error("No available backend servers!");
+        }
+
+        if (servers.size() == 1) {
+            return servers[0];
+        }
+
+        thread_local static std::mt19937 rng(std::random_device{}());
+        std::uniform_int_distribution<size_t> dist(0, servers.size() - 1);
+
+        size_t idx1 = dist(rng);
+        size_t idx2 = dist(rng);
+        while (idx1 == idx2) {
+            idx2 = dist(rng);
+        }
+
+        auto choice1 = servers[idx1];
+        auto choice2 = servers[idx2];
+
+        int load1 = choice1->active_connections.load(std::memory_order_relaxed);
+        int load2 = choice2->active_connections.load(std::memory_order_relaxed);
+
+        double cost1 = load1 - (choice1->dynamic_score / 10.0);
+        double cost2 = load2 - (choice2->dynamic_score / 10.0);
+
+        std::shared_ptr<BackendServer> selected = (cost1 <= cost2) ? choice1 : choice2;
+
+        std::cout << "[P2C Pick] Choice A: " << choice1->id << " (" << load1 << " conn)"
+                  << " vs Choice B: " << choice2->id << " (" << load2 << " conn)"
+                  << " ---> Selected: " << selected->id << "\n";
+
+        return selected;
+    }
+};
