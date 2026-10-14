@@ -138,3 +138,99 @@ public:
         return selected;
     }
 };
+
+------------------------------------------------------------
+// AUTOMATED BACKGROUND TRAFFIC GENERATOR
+// -------------------------------------------------------------
+class AutomatedTrafficSimulator {
+private:
+    DynamicP2CLoadBalancer& balancer;
+    std::atomic<bool> running{false};
+    std::thread worker_thread;
+
+public:
+    explicit AutomatedTrafficSimulator(DynamicP2CLoadBalancer& lb) : balancer(lb) {}
+
+    ~AutomatedTrafficSimulator() {
+        stop();
+    }
+
+    void start(int requests_per_second = 10) {
+        running = true;
+        worker_thread = std::thread([this, requests_per_second]() {
+            std::mt19937 rng(std::random_device{}());
+            // Random connection hold duration (between 200ms and 1500ms)
+            std::uniform_int_distribution<int> duration_dist(200, 1500);
+
+            while (running) {
+                try {
+                    // Pick best server using P2C
+                    auto target_server = balancer.getBestServer();
+                    int hold_ms = duration_dist(rng);
+
+                    // Spawn asynchronous connection worker using std::async
+                    std::async(std::launch::async, [target_server, hold_ms]() {
+                        // RAII Guard increments connection counter
+                        ScopedConnection conn(target_server);
+                        
+                        // Simulate work duration
+                        std::this_thread::sleep_for(std::chrono::milliseconds(hold_ms));
+                        
+                        // RAII Guard destructs here and decrements connection counter automatically
+                    });
+
+                } catch (const std::exception& e) {
+                    // Server pool empty or initialization error
+                }
+
+                // Throttle request generation rate
+                std::this_thread::sleep_for(std::chrono::milliseconds(1000 / requests_per_second));
+            }
+        });
+    }
+
+    void stop() {
+        if (running) {
+            running = false;
+            if (worker_thread.joinable()) {
+                worker_thread.join();
+            }
+        }
+    }
+};
+
+// -------------------------------------------------------------
+// MAIN DEMONSTRATION
+// -------------------------------------------------------------
+int main() {
+    DynamicP2CLoadBalancer lb;
+
+    // 1. Add servers to the pool
+    lb.addServer(std::make_shared<BackendServer>("Server_A", "65.2.127.208", 8080));
+    lb.addServer(std::make_shared<BackendServer>("Server_B", "15.207.110.155", 8080));
+    lb.addServer(std::make_shared<BackendServer>("Server_C", "15.252.108.112", 8080));
+    lb.addServer(std::make_shared<BackendServer>("Server_D", "3.6.126.183", 8080));
+
+    std::cout << "\n--- Starting Automated Background Traffic Generator ---\n";
+    AutomatedTrafficSimulator simulator(lb);
+    simulator.start(15); // Generate ~15 automated requests/sec
+
+    // 2. Monitor real-time dynamic load variations over 6 seconds
+    for (int second = 1; second <= 6; ++second) {
+        std::this_thread::sleep_for(std::chrono::seconds(1));
+
+        std::cout << "\n==================================================";
+        std::cout << "\n[REAL-TIME METRICS - SECOND " << second << "]";
+        std::cout << "\n==================================================\n";
+
+        for (const auto& server : lb.getServers()) {
+            std::cout << server->id << " -> Active Connections: " 
+                      << server->active_connections.load() << "\n";
+        }
+    }
+
+    std::cout << "\nStopping traffic simulator...\n";
+    simulator.stop();
+
+    return 0;
+}
